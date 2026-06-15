@@ -11,7 +11,7 @@ import numpy as np
 import sounddevice as sd
 from mutagen import File as MutagenFile
 from PySide6.QtCore import QSize, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QLinearGradient, QPainter, QPen, QPixmap, QBrush
+from PySide6.QtGui import QAction, QColor, QLinearGradient, QPainter, QPen, QPixmap, QBrush, QPainterPath, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -194,6 +194,10 @@ class DJAudioEngine:
             callback=self._callback,
         )
         self.stream.start()
+        # --- LAUNCHPAD: Pamięć i domyślne dźwięki ---
+        self.sampler_pads = [None] * 8
+        self.active_samples = [] 
+        self._generate_default_samples()
 
     def close(self):
         self.stream.stop()
@@ -201,12 +205,21 @@ class DJAudioEngine:
 
     def load_deck(self, deck_index: int, track: Track, autoplay: bool = False):
         samples = decode_audio(track.path)
+        
+        # --- NORMALIZACJA GŁOŚNOŚCI (Wyrównywanie poziomów RMS) ---
+        rms = np.sqrt(np.mean(samples**2))
+        if rms > 0.0001:
+            target_rms = 0.15 # Nasz standardowy, przyjemny dla ucha punkt odniesienia
+            gain = min(target_rms / rms, 4.0) # Maksymalnie 4-krotne wzmocnienie, by nie zepsuć szumu
+            samples = samples * gain
+            samples = np.clip(samples, -1.0, 1.0).astype(np.float32)
+
         with self.lock:
             deck = self.decks[deck_index]
             deck.audio = samples
-            deck.position = 0
-            deck.scratch_target = 0.0 # DODANO
-            deck.scratching = False   # DODANO
+            deck.position = 0.0
+            deck.scratch_target = 0.0
+            deck.scratching = False
             deck.track = track
             deck.playing = autoplay
             deck.spectrum.fill(0)
@@ -250,6 +263,38 @@ class DJAudioEngine:
                 "duration": deck.duration(),
                 "spectrum": deck.spectrum.copy(),
             }
+
+    def _generate_default_samples(self):
+        # Programowe wygenerowanie domyślnych dźwięków bez zewnętrznych plików
+        # Pad 1: Stopa (Kick)
+        t = np.linspace(0, 0.3, int(SAMPLE_RATE * 0.3), False).astype(np.float32)
+        freq = np.geomspace(150, 30, len(t)).astype(np.float32)
+        kick = (np.sin(2 * np.pi * freq * t) * np.exp(-t * 10)).astype(np.float32)
+        self.sampler_pads[0] = np.column_stack((kick, kick)) * 0.8
+        
+        # Pad 2: Hi-hat
+        hh = ((np.random.rand(int(SAMPLE_RATE * 0.1)).astype(np.float32) * 2 - 1))
+        hh = (hh * np.exp(-np.linspace(0, 30, len(hh)).astype(np.float32)))
+        self.sampler_pads[1] = np.column_stack((hh, hh)) * 0.3
+        
+        # Pad 3: Laser / Synth Beep
+        t_beep = np.linspace(0, 0.4, int(SAMPLE_RATE * 0.4), False).astype(np.float32)
+        beep = (np.sin(2 * np.pi * 880 * t_beep) * np.exp(-t_beep * 5)).astype(np.float32)
+        self.sampler_pads[2] = np.column_stack((beep, beep)) * 0.4
+
+    def play_sample(self, index: int):
+        with self.lock:
+            if 0 <= index < 8 and self.sampler_pads[index] is not None:
+                self.active_samples.append({"audio": self.sampler_pads[index], "pos": 0})
+                
+    def load_sample(self, index: int, path: Path):
+        try:
+            audio = decode_audio(path)
+            with self.lock:
+                self.sampler_pads[index] = audio
+            return True
+        except:
+            return False
 
     @staticmethod
     def _peaking_coefficients(freq: float, gain_db: float, q: float = 1.15):
@@ -386,6 +431,23 @@ class DJAudioEngine:
         self.eq_db = eq_db
         self.master_db = master_db
         mixed = (deck_a * gain_a) + (deck_b * gain_b)
+        # --- Miksowanie aktywnych sampli z Launchpada ---
+        sampler_mix = np.zeros((frames, 2), dtype=np.float32)
+        still_active = []
+        for s in self.active_samples:
+            pos = s["pos"]
+            audio = s["audio"]
+            remains = len(audio) - pos
+            take = min(frames, remains)
+            
+            sampler_mix[:take] += audio[pos:pos+take]
+            s["pos"] += take
+            
+            if s["pos"] < len(audio):
+                still_active.append(s)
+                
+        self.active_samples = still_active
+        mixed += sampler_mix
         processed = self._master_process(mixed)
         self._update_spectrum(self.spectrum, processed)
         outdata[:] = processed
@@ -500,8 +562,17 @@ class SpinningPlatterWidget(QWidget):
             scaled_cover = self.cover_pixmap.scaled(
                 cover_size, cover_size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
             )
-            painter.drawPixmap(int(-cover_size/2), int(-cover_size/2), cover_size, cover_size, scaled_cover)
+            painter.save()
             
+            # Tworzymy okrągłą ścieżkę do wycięcia grafiki
+            clip_path = QPainterPath()
+            clip_path.addEllipse(int(-cover_size/2), int(-cover_size/2), cover_size, cover_size)
+            painter.setClipPath(clip_path)
+            
+            painter.drawPixmap(int(-cover_size/2), int(-cover_size/2), cover_size, cover_size, scaled_cover)
+            painter.restore()
+            
+        # Otwór na środku winyla
         painter.setBrush(QBrush(QColor("#0c0f14")))
         painter.drawEllipse(-4, -4, 8, 8)
 
@@ -640,6 +711,12 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         title = QLabel("Library / Queue")
         title.setObjectName("PanelTitle")
+        
+        # --- WYSZUKIWARKA ---
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Wyszukaj piosenkę...")
+        self.search_input.textChanged.connect(self._filter_library)
+        
         self.queue = QListWidget()
         self.queue.itemDoubleClicked.connect(lambda item: self.load_selected_to_deck(0, autoplay=True))
 
@@ -658,6 +735,7 @@ class MainWindow(QMainWindow):
         download.clicked.connect(self.download_youtube)
 
         layout.addWidget(title)
+        layout.addWidget(self.search_input) # DODANO
         layout.addWidget(self.queue, 1)
         layout.addWidget(add_button)
         row = QHBoxLayout()
@@ -815,6 +893,39 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.master[0], 6, 0)
         layout.addWidget(self.master[1], 6, 1, 1, 2)
         layout.addWidget(eq_box, 0, 3, 7, 1)
+        lp_box = QFrame()
+        lp_layout = QGridLayout(lp_box)
+        lp_layout.setContentsMargins(0, 0, 0, 0)
+        lp_title = QLabel("Launchpad (Klawisze 1-8)")
+        lp_title.setObjectName("PanelTitle")
+        lp_layout.addWidget(lp_title, 0, 0, 1, 4)
+        
+        self.pad_buttons = []
+        keys = ['1', '2', '3', '4', '5', '6', '7', '8']
+        default_names = ["Kick", "Hi-Hat", "Laser", "Pusty", "Pusty", "Pusty", "Pusty", "Pusty"]
+        
+        for i in range(8):
+            btn = QPushButton(f"{i+1}. {default_names[i]}")
+            btn.setMinimumHeight(45)
+            # Stylowanie przypominające sprzętowy kontroler
+            btn.setStyleSheet("background-color: #2b3a4f; border-radius: 8px; font-weight: bold;")
+            
+            # Lewy przycisk -> gra dźwięk
+            btn.clicked.connect(lambda checked=False, idx=i: self._flash_and_play_pad(idx))
+            
+            # Prawy przycisk -> menu ładowania pliku z dysku (np. śmiesznego tekstu lub nowej stopy)
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(lambda pos, idx=i: self._load_pad_sample(idx))
+            
+            # Skrót klawiszowy z głównej klawiatury komputera
+            shortcut = QShortcut(QKeySequence(keys[i]), self)
+            shortcut.activated.connect(lambda idx=i: self._flash_and_play_pad(idx))
+            
+            self.pad_buttons.append(btn)
+            lp_layout.addWidget(btn, 1 + (i//4), i%4)
+            
+        layout.addWidget(lp_box, 0, 4, 7, 2)
+        
         return panel
 
     def _standard_icon(self, name: str):
@@ -873,6 +984,12 @@ class MainWindow(QMainWindow):
         
         # Uruchom analizę BPM w tle, by nie zamrozić programu
         threading.Thread(target=self._calc_bpm_worker, args=(track, item), daemon=True).start()
+
+    def _filter_library(self, text: str):
+        search_term = text.lower()
+        for i in range(self.queue.count()):
+            item = self.queue.item(i)
+            item.setHidden(search_term not in item.text().lower())
 
     def _calc_bpm_worker(self, track: Track, item: QListWidgetItem):
         try:
@@ -1081,6 +1198,22 @@ class MainWindow(QMainWindow):
             return
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         self.apply_eq_preset(data.get("values_db", EQ_PRESETS["Flat"]))
+
+    def _flash_and_play_pad(self, index: int):
+        self.engine.play_sample(index)
+        btn = self.pad_buttons[index]
+        original_style = btn.styleSheet()
+        btn.setStyleSheet("background-color: #ffcf5a; color: black; border-radius: 8px; font-weight: bold;")
+        # Szybki reset koloru padu by zasymulować błyśnięcie
+        QTimer.singleShot(100, lambda: btn.setStyleSheet(original_style))
+
+    def _load_pad_sample(self, index: int):
+        path, _ = QFileDialog.getOpenFileName(self, f"Załaduj dźwięk na Pad {index+1}", "", "Audio (*.mp3 *.wav *.flac)")
+        if path:
+            success = self.engine.load_sample(index, Path(path))
+            if success:
+                self.pad_buttons[index].setText(Path(path).stem[:8] + "..")
+                self.pad_buttons[index].setStyleSheet("background-color: #49d2ff; color: black; border-radius: 8px; font-weight: bold;")
 
     def _tick(self):
         for index in range(2):
