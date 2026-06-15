@@ -11,7 +11,7 @@ import numpy as np
 import sounddevice as sd
 from mutagen import File as MutagenFile
 from PySide6.QtCore import QSize, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QLinearGradient, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QLinearGradient, QPainter, QPen, QPixmap, QBrush
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -44,11 +44,14 @@ EQ_BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 EQ_PRESETS = {
     "Flat": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     "Bass Boost": [7, 6, 4, 2, 0, 0, 1, 2, 2, 1],
-    "Club": [5, 4, 2, 0, 0, 2, 4, 5, 3, 2],
+    "Club / Electronic": [5, 4, 2, 0, -1, 2, 4, 5, 3, 2],
+    "Rock / Alternative": [5, 4, -1, -2, -1, 1, 3, 4, 4, 3],
+    "Hip-Hop / Rap": [6, 5, 2, 0, -1, -1, 1, 2, 3, 2],
+    "Pop": [-2, -1, 2, 4, 4, 2, -1, -2, -1, 0],
     "Vocal": [-2, -1, 0, 2, 4, 5, 4, 2, 0, -1],
+    "Acoustic": [2, 2, 1, 0, 0, 1, 2, 3, 2, 1],
     "Bright": [-2, -1, 0, 0, 1, 2, 4, 6, 7, 6],
 }
-
 TRANSITION_PRESETS = {
     "Equal Power Blend": {
         "duration": 16,
@@ -77,6 +80,19 @@ TRANSITION_PRESETS = {
         "curve": "sharp",
         "description": "Szybkie przejscie pod drop albo mocny punkt frazy.",
     },
+    # --- NOWE PRZEJŚCIA ---
+    "Gasolina Drop": {
+        "duration": 2,
+        "curve": "sharp",
+        "bass_dip": 0.0,
+        "description": "Agresywne i bardzo szybkie cięcie idealne pod dynamiczny drop lub reggaeton.",
+    },
+    "High-Pass Sweep": {
+        "duration": 16,
+        "curve": "equal_power",
+        "bass_dip": -24.0, # Ekstremalne wycięcie basu w pierwszym utworze
+        "description": "Płynne wejście z całkowitym wycięciem dołu (imitacja filtru High-Pass).",
+    }
 }
 
 
@@ -127,30 +143,36 @@ class Track:
     title: str
     artist: str
     duration: float
+    cover_path: Path | None = None
+    bpm: float = 0.0  # NOWE: pole na BPM
 
     @property
     def label(self) -> str:
         left = f"{self.artist} - {self.title}" if self.artist else self.title
         minutes = int(self.duration // 60)
         seconds = int(self.duration % 60)
-        return f"{left}   {minutes}:{seconds:02d}"
-
+        bpm_str = f" [{int(self.bpm)} BPM]" if self.bpm > 0 else ""
+        return f"{left}   {minutes}:{seconds:02d}{bpm_str}"
 
 class DeckState:
     def __init__(self, name: str):
         self.name = name
         self.audio = np.zeros((0, 2), dtype=np.float32)
-        self.position = 0
+        self.position = 0.0  # Teraz float dla precyzyjnego ułamkowego skreczu!
         self.playing = False
         self.track: Track | None = None
         self.volume = 1.0
         self.spectrum = np.zeros(128, dtype=np.float32)
+        
+        # --- Zmienne dla systemu SCRATCH ---
+        self.scratching = False
+        self.scratch_target = 0.0
 
     def duration(self) -> float:
         return len(self.audio) / SAMPLE_RATE
 
     def current_time(self) -> float:
-        return self.position / SAMPLE_RATE
+        return float(self.position) / SAMPLE_RATE
 
 
 class DJAudioEngine:
@@ -183,6 +205,8 @@ class DJAudioEngine:
             deck = self.decks[deck_index]
             deck.audio = samples
             deck.position = 0
+            deck.scratch_target = 0.0 # DODANO
+            deck.scratching = False   # DODANO
             deck.track = track
             deck.playing = autoplay
             deck.spectrum.fill(0)
@@ -205,7 +229,8 @@ class DJAudioEngine:
         with self.lock:
             deck = self.decks[deck_index]
             if len(deck.audio):
-                deck.position = int(np.clip(ratio, 0.0, 1.0) * (len(deck.audio) - 1))
+                deck.position = float(np.clip(ratio, 0.0, 1.0) * (len(deck.audio) - 1))
+                deck.scratch_target = deck.position # DODANO
 
     def set_deck_volume(self, deck_index: int, value: float):
         with self.lock:
@@ -287,18 +312,63 @@ class DJAudioEngine:
         return np.clip(out, -1.0, 1.0)
 
     def _read_deck_chunk(self, deck: DeckState, frames: int) -> np.ndarray:
-        if not deck.playing or len(deck.audio) == 0:
+        if len(deck.audio) == 0:
             chunk = np.zeros((frames, 2), dtype=np.float32)
             self._update_spectrum(deck.spectrum, chunk)
             return chunk
 
-        end = min(deck.position + frames, len(deck.audio))
-        chunk = deck.audio[deck.position:end].copy()
-        deck.position = end
-        if end >= len(deck.audio):
+        if deck.scratching:
+            start_pos = deck.position
+            end_pos = deck.scratch_target
+            
+            # Zabezpieczenie przed ekstremalnymi dźwiękami (limitujemy x5 prędkość)
+            max_speed = 5.0
+            max_diff = frames * max_speed
+            diff = end_pos - start_pos
+            if abs(diff) > max_diff:
+                end_pos = start_pos + math.copysign(max_diff, diff)
+                
+            speed = (end_pos - start_pos) / frames
+            
+            # Jeśli winyl w miejscu stoi pod palcem (cisza/szum)
+            if abs(speed) < 0.01:
+                chunk = np.zeros((frames, 2), dtype=np.float32)
+                deck.position = end_pos
+            else:
+                # Interpolacja liniowa ułamków – resampling przyspieszający / zwalniający
+                idx = start_pos + np.arange(frames) * speed
+                max_idx = len(deck.audio) - 1
+                idx_clipped = np.clip(idx, 0, max_idx)
+                
+                idx_floor = np.floor(idx_clipped).astype(int)
+                idx_ceil = np.clip(idx_floor + 1, 0, max_idx)
+                frac = (idx_clipped - idx_floor)[:, np.newaxis].astype(np.float32)
+                
+                # Faktyczne mieszanie dwóch sąsiadujących cyfrowych próbek (powstaje piskliwy dźwięk skreczu)
+                chunk = deck.audio[idx_floor] * (1.0 - frac) + deck.audio[idx_ceil] * frac
+                deck.position = end_pos
+                
+            self._update_spectrum(deck.spectrum, chunk)
+            return chunk.astype(np.float32)
+
+        if not deck.playing:
+            chunk = np.zeros((frames, 2), dtype=np.float32)
+            self._update_spectrum(deck.spectrum, chunk)
+            return chunk
+
+        # Normalne odtwarzanie bez ruszania winyla
+        start_idx = int(deck.position)
+        end_idx = min(start_idx + frames, len(deck.audio))
+        chunk = deck.audio[start_idx:end_idx].copy()
+        deck.position += float(frames)
+        
+        if end_idx >= len(deck.audio):
             deck.playing = False
+            deck.position = float(len(deck.audio) - 1)
+            
         if len(chunk) < frames:
             chunk = np.vstack([chunk, np.zeros((frames - len(chunk), 2), dtype=np.float32)])
+            
         self._update_spectrum(deck.spectrum, chunk)
         return chunk
 
@@ -321,34 +391,119 @@ class DJAudioEngine:
         outdata[:] = processed
 
 
-class SpectrumWidget(QWidget):
-    def __init__(self, values_getter):
+class SpinningPlatterWidget(QWidget):
+    def __init__(self, engine, deck_index):
         super().__init__()
-        self.values_getter = values_getter
-        self.setMinimumHeight(120)
+        self.engine = engine
+        self.deck_index = deck_index
+        self.setMinimumSize(140, 140)
+        self.angle = 0.0
+        self.cover_pixmap = None
+        self.current_track = None
+        
+        # --- Zmienne do interakcji i scratchowania ---
+        self.is_dragging = False
+        self.last_mouse_angle = 0.0
 
+    def _get_mouse_angle(self, pos):
+        # Oblicza kąt myszki względem środka winyla
+        rect = self.rect()
+        cx, cy = rect.width() / 2.0, rect.height() / 2.0
+        dx = pos.x() - cx
+        dy = pos.y() - cy
+        return math.degrees(math.atan2(dy, dx))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.is_dragging = True
+            self.last_mouse_angle = self._get_mouse_angle(event.position())
+            with self.engine.lock:
+                deck = self.engine.decks[self.deck_index]
+                deck.scratching = True
+                deck.scratch_target = float(deck.position)
+
+    def mouseMoveEvent(self, event):
+        if self.is_dragging:
+            current_angle = self._get_mouse_angle(event.position())
+            delta = current_angle - self.last_mouse_angle
+            
+            if delta > 180:
+                delta -= 360
+            elif delta < -180:
+                delta += 360
+                
+            self.angle += delta
+            self.last_mouse_angle = current_angle
+            
+            with self.engine.lock:
+                deck = self.engine.decks[self.deck_index]
+                if len(deck.audio) > 0:
+                    # Mnożnik określa jak długi kawałek odczytujemy (czułość skreczu)
+                    sample_shift = delta * 0.015 * 44100
+                    deck.scratch_target = np.clip(deck.scratch_target + sample_shift, 0, float(len(deck.audio) - 1))
+            
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.is_dragging = False
+            with self.engine.lock:
+                deck = self.engine.decks[self.deck_index]
+                deck.scratching = False
+                deck.position = deck.scratch_target
+                
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         rect = self.rect()
-        painter.fillRect(rect, QColor("#11151c"))
-        gradient = QLinearGradient(0, 0, 0, rect.height())
-        gradient.setColorAt(0, QColor("#49d2ff"))
-        gradient.setColorAt(0.55, QColor("#71f79f"))
-        gradient.setColorAt(1, QColor("#ffcf5a"))
-        values = self.values_getter()
-        bar_gap = 2
-        bar_width = max(2, (rect.width() - bar_gap * (len(values) - 1)) / len(values))
-        for i, value in enumerate(values):
-            height = float(value) * (rect.height() - 16)
-            x = i * (bar_width + bar_gap)
-            y = rect.height() - height
-            painter.fillRect(QRectF(x, y, bar_width, height), gradient)
-        painter.setPen(QPen(QColor("#273244"), 1))
-        for i in range(1, 4):
-            y = rect.height() * i / 4
-            painter.drawLine(0, y, rect.width(), y)
+        
+        size = min(rect.width(), rect.height())
+        cx, cy = rect.width() / 2, rect.height() / 2
+        
+        status = self.engine.deck_status(self.deck_index)
+        
+        # Płyta sama się kręci tylko wtedy, gdy muzyka gra i nikt jej NIE trzyma
+        if status["playing"] and not self.is_dragging:
+            self.angle += 3.0
+            if self.angle >= 360:
+                self.angle -= 360
 
+        # Wczytanie okładki
+        track = status["track"]
+        if track != self.current_track:
+            self.current_track = track
+            self.cover_pixmap = None
+            if track and track.cover_path and track.cover_path.exists():
+                self.cover_pixmap = QPixmap(str(track.cover_path))
+        
+        # Tło winyla
+        painter.setBrush(QBrush(QColor("#111111")))
+        painter.setPen(QPen(QColor("#273244"), 2))
+        painter.drawEllipse(int(cx - size/2), int(cy - size/2), int(size), int(size))
+        
+        # Rowki
+        painter.setPen(QPen(QColor("#1a1a1a"), 1))
+        for i in range(1, 6):
+            r = size/2 - i*10
+            if r > 0:
+                painter.drawEllipse(int(cx - r), int(cy - r), int(r*2), int(r*2))
+        
+        # Obrót obszaru roboczego do malowania okładki
+        painter.translate(cx, cy)
+        painter.rotate(self.angle)
+        
+        cover_size = int(size * 0.45)
+        painter.setBrush(QBrush(QColor("#245070")))
+        painter.drawEllipse(int(-cover_size/2), int(-cover_size/2), cover_size, cover_size)
+        
+        if self.cover_pixmap and not self.cover_pixmap.isNull():
+            scaled_cover = self.cover_pixmap.scaled(
+                cover_size, cover_size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            )
+            painter.drawPixmap(int(-cover_size/2), int(-cover_size/2), cover_size, cover_size, scaled_cover)
+            
+        painter.setBrush(QBrush(QColor("#0c0f14")))
+        painter.drawEllipse(-4, -4, 8, 8)
 
 class KnobSlider(QWidget):
     value_changed = Signal(float)
@@ -381,8 +536,37 @@ class KnobSlider(QWidget):
         self.slider.setValue(int(round(value * 10)))
 
 
+class SpectrumWidget(QWidget):
+    def __init__(self, values_getter):
+        super().__init__()
+        self.values_getter = values_getter
+        self.setMinimumHeight(120)
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+        painter.fillRect(rect, QColor("#11151c"))
+        gradient = QLinearGradient(0, 0, 0, rect.height())
+        gradient.setColorAt(0, QColor("#49d2ff"))
+        gradient.setColorAt(0.55, QColor("#71f79f"))
+        gradient.setColorAt(1, QColor("#ffcf5a"))
+        values = self.values_getter()
+        bar_gap = 2
+        bar_width = max(2, (rect.width() - bar_gap * (len(values) - 1)) / len(values))
+        for i, value in enumerate(values):
+            height = float(value) * (rect.height() - 16)
+            x = i * (bar_width + bar_gap)
+            y = rect.height() - height
+            painter.fillRect(QRectF(x, y, bar_width, height), gradient)
+        painter.setPen(QPen(QColor("#273244"), 1))
+        for i in range(1, 4):
+            y = rect.height() * i / 4
+            painter.drawLine(0, y, rect.width(), y)
+
 class MainWindow(QMainWindow):
     download_finished = Signal(str, str)
+    bpm_calculated = Signal(QListWidgetItem, str) # NOWY SYGNAŁ
 
     def __init__(self):
         super().__init__()
@@ -401,6 +585,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self.download_finished.connect(self._download_finished)
+        self.bpm_calculated.connect(self._update_bpm_label) # NOWE
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(33)
@@ -483,6 +668,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("YouTube import"))
         layout.addWidget(self.youtube_input)
         layout.addWidget(download)
+        suggest_layout = QHBoxLayout()
+        match_a_btn = QPushButton("Match to Deck A")
+        match_b_btn = QPushButton("Match to Deck B")
+        match_a_btn.clicked.connect(lambda: self.suggest_matching(0))
+        match_b_btn.clicked.connect(lambda: self.suggest_matching(1))
+        
+        suggest_layout.addWidget(match_a_btn)
+        suggest_layout.addWidget(match_b_btn)
+        layout.addWidget(QLabel("BPM Match"))
+        layout.addLayout(suggest_layout)
+        
         return panel
 
     def _build_deck_panel(self, deck_index: int, title_text: str):
@@ -495,7 +691,14 @@ class MainWindow(QMainWindow):
         track_label = QLabel("No track")
         track_label.setObjectName("DeckTitle")
         spectrum = SpectrumWidget(lambda i=deck_index: self.engine.deck_status(i)["spectrum"])
-        play = self._tool_button(self._standard_icon("SP_MediaPlay"), lambda i=deck_index: self.toggle_deck(i))
+        platter = SpinningPlatterWidget(self.engine, deck_index) 
+        
+        # Układ ułożenia poziomego widma i obracającej się płyty
+        visual_layout = QHBoxLayout()
+        visual_layout.addWidget(platter)
+        visual_layout.addWidget(spectrum, 1)
+
+        play = self._tool_button(self._standard_icon("SP_MediaPlay"), lambda checked=False, i=deck_index: self.toggle_deck(i))
         cue = QPushButton("Cue")
         cue.clicked.connect(lambda _checked=False, i=deck_index: self.cue_deck(i))
         progress = QSlider(Qt.Horizontal)
@@ -512,12 +715,14 @@ class MainWindow(QMainWindow):
             self.deck_a_progress = progress
             self.deck_a_time = time_label
             self.deck_a_spectrum = spectrum
+            self.deck_a_platter = platter # NOWE
         else:
             self.deck_b_label = track_label
             self.deck_b_play = play
             self.deck_b_progress = progress
             self.deck_b_time = time_label
             self.deck_b_spectrum = spectrum
+            self.deck_b_platter = platter # NOWE
 
         transport = QHBoxLayout()
         transport.addStretch()
@@ -526,7 +731,9 @@ class MainWindow(QMainWindow):
         transport.addStretch()
         layout.addWidget(title)
         layout.addWidget(track_label)
-        layout.addWidget(spectrum)
+        layout.addWidget(title)
+        layout.addWidget(track_label)
+        layout.addLayout(visual_layout) # ZAMIAST layout.addWidget(spectrum)
         layout.addLayout(transport)
         layout.addWidget(progress)
         layout.addWidget(time_label)
@@ -576,6 +783,11 @@ class MainWindow(QMainWindow):
             self.eq_sliders.append(slider)
             sliders.addWidget(slider)
         preset_row = QHBoxLayout()
+        self.eq_combo = QComboBox()
+        self.eq_combo.addItems(EQ_PRESETS.keys())
+        self.eq_combo.currentTextChanged.connect(
+            lambda text: self.apply_eq_preset(EQ_PRESETS[text]) if text in EQ_PRESETS else None
+        )
         save = QPushButton("Save EQ")
         save.clicked.connect(self.save_eq_preset)
         load = QPushButton("Load EQ")
@@ -658,6 +870,56 @@ class MainWindow(QMainWindow):
         item = QListWidgetItem(track.label)
         item.setData(Qt.UserRole, len(self.tracks) - 1)
         self.queue.addItem(item)
+        
+        # Uruchom analizę BPM w tle, by nie zamrozić programu
+        threading.Thread(target=self._calc_bpm_worker, args=(track, item), daemon=True).start()
+
+    def _calc_bpm_worker(self, track: Track, item: QListWidgetItem):
+        try:
+            import librosa
+            # Pobieramy próbki (to może potrwać parę sekund)
+            samples = decode_audio(track.path)
+            # Librosa preferuje dźwięk mono do detekcji bitów
+            mono = np.mean(samples, axis=1)
+            
+            # Właściwa analiza BPM
+            tempo, _ = librosa.beat.beat_track(y=mono, sr=SAMPLE_RATE)
+            
+            if isinstance(tempo, np.ndarray):
+                bpm = float(tempo[0])
+            else:
+                bpm = float(tempo)
+                
+            track.bpm = round(bpm)
+            # Wysłanie sygnału do zaktualizowania wpisu w głównym wątku UI
+            self.bpm_calculated.emit(item, track.label)
+        except Exception as e:
+            print(f"Błąd podczas obliczania BPM: {e}")
+
+    def _update_bpm_label(self, item: QListWidgetItem, new_label: str):
+        item.setText(new_label)
+
+    def suggest_matching(self, deck_index: int):
+        status = self.engine.deck_status(deck_index)
+        track = status["track"]
+        
+        if not track or not track.bpm:
+            QMessageBox.information(self, "Brak danych", f"Deck {'A' if deck_index == 0 else 'B'} jest pusty lub BPM wciąż się oblicza.")
+            return
+
+        target_bpm = track.bpm
+        
+        # Sortowanie biblioteki wg różnicy BPM. Utwory bez obliczonego BPM lądują na końcu.
+        self.tracks.sort(key=lambda t: abs(t.bpm - target_bpm) if t.bpm else 9999)
+
+        # Odświeżenie listy z podświetleniem świetnych dopasowań (+/- 4 BPM)
+        self.queue.clear()
+        for i, t in enumerate(self.tracks):
+            item = QListWidgetItem(t.label)
+            if t.bpm and abs(t.bpm - target_bpm) <= 4:
+                item.setBackground(QColor("#245028")) # Zielonkawe tło dla idealnych kandydatek
+            item.setData(Qt.UserRole, i)
+            self.queue.addItem(item)
 
     def remove_selected(self):
         row = self.queue.currentRow()
@@ -677,7 +939,16 @@ class MainWindow(QMainWindow):
             artist = (meta.get("artist") or [""])[0]
             if meta.info is not None:
                 duration = float(getattr(meta.info, "length", 0.0) or 0.0)
-        return Track(path=path, title=title, artist=artist, duration=duration)
+                
+        # Szukanie okładki/miniaturki (yt-dlp zapisuje np. jako .webp lub .jpg)
+        cover_path = None
+        for ext in ['.webp', '.jpg', '.png', '.jpeg']:
+            possible_cover = path.with_suffix(ext)
+            if possible_cover.exists():
+                cover_path = possible_cover
+                break
+
+        return Track(path=path, title=title, artist=artist, duration=duration, cover_path=cover_path)
 
     def load_selected_to_deck(self, deck_index: int, autoplay: bool = False):
         row = self.queue.currentRow()
@@ -763,6 +1034,7 @@ class MainWindow(QMainWindow):
                 "outtmpl": str(output_dir / "%(title).180s.%(ext)s"),
                 "quiet": True,
                 "noplaylist": True,
+                "writethumbnail": True, # <-- DODANO: pobieranie miniaturki z YT
             }
             with yt_dlp.YoutubeDL(options) as downloader:
                 info = downloader.extract_info(url, download=True)
@@ -841,6 +1113,8 @@ class MainWindow(QMainWindow):
         self.crossfader_label.setText(f"Crossfader: {int((1.0 - cf) * 100)}% A / {int(cf * 100)}% B")
         self.deck_a_spectrum.update()
         self.deck_b_spectrum.update()
+        self.deck_a_platter.update() # NOWE Odświeżanie płyty A
+        self.deck_b_platter.update() # NOWE Odświeżanie płyty B
         self.master_spectrum.update()
 
     @staticmethod
