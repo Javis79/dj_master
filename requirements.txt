@@ -1,0 +1,6 @@
+numpy>=1.26
+PySide6>=6.7
+sounddevice>=0.4.7
+mutagen>=1.47.0
+imageio-ffmpeg>=0.5.1
+yt-dlp>=2026.1.1
